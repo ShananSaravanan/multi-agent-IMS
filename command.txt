@@ -1,0 +1,14 @@
+**Remember to open docker and change the IP for cloud machine
+
+vllm serve "Qwen/Qwen3-4B" --max_model_len 24000 --enable-auto-tool-choice --tool-call-parser hermes
+
+uvicorn retail_multi_agent_and_fast_api:app --reload --port 8181
+
+Queries:
+-Can you give me a summary of the sales performance for Store S001 for current month
+-Can you compare the sales of that store with store S002
+-Help me generate the restock plan for store S001 during the end of this month
+-Can you help me retrieve the top 10 products sold during the last day of dec2023 in that store?
+
+
+
