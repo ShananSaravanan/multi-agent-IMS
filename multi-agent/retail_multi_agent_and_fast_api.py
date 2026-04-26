@@ -527,6 +527,10 @@ def build_agent(TOOLS, tools_by_name, agent):
                     "name": msg.name,
                     "content": msg.content,
                 })
+        # 🛡️ SAFETY NET: Sliding Window Memory (Prevent Context Explosions)
+        # Always keep the System Prompt (index 0), but restrict history to the last 10 messages
+        if len(converted_messages) > 11:
+            converted_messages = [converted_messages[0]] + converted_messages[-10:]
 
         max_tokens = 1500
         
@@ -1124,8 +1128,9 @@ def summarize_sales_tool(state: dict) -> dict:
                 r.get('Units_Sold') or r.get('units_sold', 0)
                 for r in records
             )
+            # 🐛 FIX: Safely cast to float in case SQL returns strings/Decimals
             total_revenue = sum(
-                (r.get('Revenue') or r.get('revenue', 0) or 0)
+                float(r.get('Revenue') or r.get('revenue', 0) or r.get('Total_Revenue', 0) or 0)
                 for r in records
             )
 
@@ -1682,8 +1687,17 @@ Remember:
         return Command(goto=END, update={"messages": messages})
 
     # Find all important responses from agents in the conversation
+    # 🐛 FIX: Only summarize agent responses from the CURRENT conversational turn
     agent_responses = []
-    for msg in messages:
+    last_human_idx = 0
+    
+    # Find the index of the most recent user question
+    for i, msg in enumerate(messages):
+        if isinstance(msg, HumanMessage):
+            last_human_idx = i
+
+    # Only extract AI responses that happened AFTER the user's question
+    for msg in messages[last_human_idx:]:
         if isinstance(msg, AIMessage) and msg.content and not (hasattr(msg, 'tool_calls') and msg.tool_calls):
             agent_responses.append(msg.content)
 
@@ -1697,12 +1711,13 @@ Remember:
     {agent_responses_text}
 
     Important Guidelines for Summarization:
-    -Do not fabricate or assume any values. If the sales analyst agent (or any other agent) omits key data such as total revenue or total sales, do not invent or estimate these figures under any circumstances.
-    -Focus on answering the question from the user.
+    - Do not fabricate or assume any values. If the sales analyst agent (or any other agent) omits key data, do not invent or estimate these figures under any circumstances.
+    - If the user asks a hypothetical "What If" question (e.g., "At what percentage of demand do we need to restock?"), DO NOT invent math examples. State clearly: "Restock thresholds are calculated per-product based on their specific Lead Time and Safety Stock. Please specify a product ID to simulate a demand increase."
+    - STRICT RULE: You are a professional executive assistant. DO NOT output any internal thought processes. DO NOT output <think> tags. Do not explain your methodology. 
 
-    Provide a concise answer (MUST under 300 words) with:
+    Provide a concise answer (MUST be under 100 words) with:
     - Direct answer to the user's question
-    - No background explanations or methodology
+    - No background explanations
 
     If no relevant data found, ask user to provide more details.
     """
@@ -1817,43 +1832,26 @@ def sql_agent_node(state: SupervisorState) -> Command[Literal["SUPERVISOR_AGENT"
     sql_system_prompt = SystemMessage(content=f"""
     You are a MySQL data retrieval specialist that returns exactly the data requested.
 
-    Your ONLY purpose is to fetch raw data with ALL fields explicitly requested by the agent.
-
     Process:
-    1. FIRST, extract and list all specific fields mentioned in the request (e.g., Units_Sold, Inventory_Level, Category)
-    2. MUST use list_tables_tool to identify which tables contain these fields
-    3. Write a SELECT query that includes EVERY requested field and make sure you use the proper filtering or aggregation in order to reduce the size of the results.
-    4. ALWAYS validate your query using `query_checker_tool`
-    5. Execute the validated query using `db_query_tool`
+    1. Extract and list all specific fields mentioned in the request.
+    2. MUST use list_tables_tool to identify which tables contain these fields.
+    3. Write the SELECT query.
+    4. IMMEDIATELY execute the query using `db_query_tool`. (Do NOT use `query_checker_tool`).
 
     Response format:
-    - Output the query result as a **JSON array of objects**, where each object is a row with keys matching the field names.
-    - Each key must be the exact column name from the SELECT query.
+    - Output the query result as a **JSON array of objects**, where each object is a row.
     - DO NOT use Markdown tables or plain text. Return ONLY structured JSON.
 
     Critical rules:
     - NEVER omit any requested field.
     - ONLY query the `inventory` table. NEVER query a table named `inventory_data`.
-    - If a field is requested but doesn't match schema exactly, find and use the closest valid column name.
-    - When the user refers to 'current month', interpret it as {current_month_year}.
-    - If the request is time-specific, filter by the exact date or month using `DATE_FORMAT(Date, '%Y-%m')`.
-    - If the request contains 'top products sold', order by the `Units_Sold`.
-    - DO NOT use AVG on a single date's data. That is incorrect.
+    - When the user refers to '{current_month_year}', format it as '2026-04' in the query using: `WHERE DATE_FORMAT(Date, '%Y-%m') = '2026-04'`.
+    - DO NOT use AVG on a single date's data.
+    - MySQL ONLY_FULL_GROUP_BY Rule: Every column in your SELECT clause MUST be wrapped in an aggregation function (like SUM or MAX) OR it MUST be listed in the GROUP BY clause.
     
     - If the Sales Analyst Agent asks for Units Sold/Revenue for one or more full months:
-      1. ALWAYS use aggregation functions:
-         * `SUM(Units_Sold) AS Units_Sold`
-         * `SUM(Units_Sold * Price * (1 - Discount/100)) AS Revenue`
-      2. Include these fields in your SELECT clause:
-         * Required aggregated fields: `SUM(Units_Sold)`, `SUM(Units_Sold * Price * (1 - Discount/100))`
-         * Required grouping fields: `Store_ID`, `Product_ID` (and `Category` if requested)
-         * IMPORTANT: When multiple months are requested, ALWAYS include date information in your output
-      3. For month-level breakdown, use MySQL DATE_FORMAT:
-         * `DATE_FORMAT(Date, '%Y-%m') AS Month`
-      4. ALWAYS include a GROUP BY clause with appropriate dimensions:
-         * Example: `GROUP BY Store_ID, Product_ID, Category, DATE_FORMAT(Date, '%Y-%m')` 
-         * Example: `GROUP BY DATE_FORMAT(Date, '%Y-%m')` if only month-level data is requested
-      5. ALWAYS Refer this example of a correct query with month-level breakdown when Sales Analyst Agent asks for monthly sales data:
+      1. ALWAYS use aggregation functions: `SUM(Units_Sold) AS Units_Sold` and `SUM(Units_Sold * Price * (1 - Discount/100)) AS Revenue`
+      2. ALWAYS Refer this exact example:
          ```sql
             SELECT
               Store_ID,
@@ -1864,74 +1862,31 @@ def sql_agent_node(state: SupervisorState) -> Command[Literal["SUPERVISOR_AGENT"
               SUM(Units_Sold * Price * (1 - Discount/100)) AS Revenue
             FROM inventory
             WHERE Store_ID = 'S004'
-              AND DATE_FORMAT(Date, '%Y-%m') IN ('2022-01', '2022-02')
+              AND DATE_FORMAT(Date, '%Y-%m') = '2026-04'
             GROUP BY Store_ID, Product_ID, Category, DATE_FORMAT(Date, '%Y-%m');
          ```
 
-    - If the Inventory Management Agent requests inventory data that includes `Average_Units_Sold`:
-      1. **`Average_Units_Sold`** should be computed as the **average of daily `Units_Sold` values** for each product over the **requested month** (do NOT use previous month logic).
-      2. Use a **JOIN** between:
-         - A subquery for the latest inventory data (`MAX(Inventory_Level)`) for the requested month.
-         - A subquery that calculates the **monthly average of daily `Units_Sold`** for each product.
-      3. MUST refer to this EXACT example to avoid GROUP BY errors:
-      ```sql
-        SELECT current.Product_ID,
-               current.Category,
-               current.Inventory_Level,
-               avg_data.Average_Units_Sold
-        FROM
-            (SELECT Product_ID, Category, MAX(Inventory_Level) AS Inventory_Level
-             FROM inventory
-             WHERE DATE_FORMAT(Date, '%Y-%m') = '{{year_month}}'
-             GROUP BY Product_ID, Category) AS current
-        JOIN
-            (SELECT Product_ID, AVG(Units_Sold) AS Average_Units_Sold
-             FROM inventory
-             WHERE DATE_FORMAT(Date, '%Y-%m') = '{{year_month}}'
-             GROUP BY Product_ID) AS avg_data
-        ON current.Product_ID = avg_data.Product_ID;
-      ```
-
-    - If the agent asks for sales data ONLY by specific day NOT by month, refer to this example:
-    ```sql
-       SELECT Product_ID, Units_Sold, (Units_Sold * Price * (1 - Discount / 100)) AS Revenue
-       FROM inventory
-       WHERE Store_ID = 'S001' AND Date = '2023-12-31'
-       ORDER BY Units_Sold DESC LIMIT 5;
-    ```
     - If the Inventory Management Agent requests inventory data to plan restocks:
       1. You need the current inventory, total demand (sales) for that month, safety stock, and lead time.
-      2. Use a **JOIN** between:
-         - A subquery for the latest inventory data (`MAX(Inventory_Level)`, `MAX(Safety_Stock)`, `MAX(Lead_Time_Days)`) for the requested month.
-         - A subquery that calculates the **TOTAL monthly demand (`SUM(Units_Sold) AS Monthly_Demand`)** for each product.
-      3. MUST refer to this EXACT example to avoid GROUP BY errors:
+      2. You MUST wrap the static numbers (Inventory_Level, Safety_Stock, Lead_Time_Days) in MAX() to satisfy MySQL grouping rules.
+      3. MUST copy this EXACT single-query example to avoid Error 1055:
       ```sql
-        SELECT current.Product_ID,
-               current.Category,
-               current.Inventory_Level,
-               current.Safety_Stock,
-               current.Lead_Time_Days,
-               demand_data.Monthly_Demand
-        FROM
-            (SELECT Product_ID, Category, MAX(Inventory_Level) AS Inventory_Level, MAX(Safety_Stock) AS Safety_Stock, MAX(Lead_Time_Days) AS Lead_Time_Days
-             FROM inventory
-             WHERE DATE_FORMAT(Date, '%Y-%m') = '{{year_month}}'
-             GROUP BY Product_ID, Category) AS current
-        JOIN
-            (SELECT Product_ID, SUM(Units_Sold) AS Monthly_Demand
-             FROM inventory
-             WHERE DATE_FORMAT(Date, '%Y-%m') = '{{year_month}}'
-             GROUP BY Product_ID) AS demand_data
-        ON current.Product_ID = demand_data.Product_ID;
+        SELECT 
+            Product_ID, 
+            Category, 
+            MAX(Inventory_Level) AS Inventory_Level, 
+            MAX(Safety_Stock) AS Safety_Stock, 
+            MAX(Lead_Time_Days) AS Lead_Time_Days, 
+            SUM(Units_Sold) AS Monthly_Demand 
+        FROM inventory 
+        WHERE DATE_FORMAT(Date, '%Y-%m') = '2026-04' 
+        GROUP BY Product_ID, Category;
       ```
+
     Checklist before final output:
     ✅ Query includes ALL requested fields (including Category if asked)
-    ✅ Every column in the SELECT clause is included in the GROUP BY clause (unless it is an aggregate function like SUM, AVG, MAX).
-    ✅ Revenue is computed correctly using the formula
-    ✅ Aggregation is used for monthly totals if required
-    ✅ Query is validated
+    ✅ MySQL Grouping Rules are satisfied (un-grouped columns use MAX or SUM)
     ✅ Output is structured JSON with no markdown or commentary
-    ✅ If the query returns no rows, return a structured JSON with status "no_data" and a clear message (not an empty list)
 
     /no_think
     """)
@@ -2137,45 +2092,34 @@ def sales_analyst_agent_node(state: SupervisorState) -> Command[Literal["SUPERVI
         - Look through previous messages from the SQL agent. If NO data from SQL agent, you MUST call `get_sales_data_tool`.
         - If the user or another agent asks for "top", "most", "highest", or any ranked/aggregated result, ensure you request the data sorted — e.g., descending by Units_Sold or Revenue.
         - You must NOT use data from Inventory Management Agent or Supervisor Agent.
-        - Data is considered valid only if all records include values for: `Product_ID` or `Category`, `Units_Sold`, `Revenue`, and `Date`.
+        - Data is considered valid only if all records include values for: `Product_ID` or `Category`, `Units_Sold`, `Revenue`, and `Date/Month`.
 
      2. **Determine the appropriate date range** based on the user query:
 
         - ✅ If the user query is asking for **sales trends, comparisons, or performance changes over time**, you MUST retrieve:
-          - The requested month **AND**
-          - The **preceding month**
-          - Restrict results to the **last day of each month only**
-          - Example triggers: "How did sales change?", "Compare December to November", "performance in December"
+          - BOTH the requested month AND the preceding month (e.g., if asked for April, fetch March AND April).
+          - You MUST explicitly instruct the SQL agent to group the data by `Product_ID` and `Month`.
+          - You MUST explicitly ask for `Product_ID`, `Category`, `Units_Sold`, and `Revenue`.
+          - Example triggers: "How did sales change?", "Compare December to November", "give me a sales trend"
 
-        - ✅ If the user is asking for **a specific metric or extreme value limited to one month** (e.g., “What category had the most sales in December?” or “Which product sold the most in Jan 2022?”), you MUST:
-          - Retrieve data for **only the requested month**
-          - Do NOT include preceding month
-          - Sort if necessary based on Units_Sold or Revenue
-        
-        - Never assume or guess — always align with the actual intent of the query.
+        - ✅ If the user is asking for **a specific metric or extreme value limited to one month** (e.g., “What category had the most sales in December?”), you MUST:
+          - Retrieve data for **only the requested month**.
+          - You MUST explicitly ask the SQL agent to include `Product_ID`, `Category`, `Units_Sold`, and `Revenue`.
 
      3. **If data is missing or incomplete**:
-        - MUST Call `get_sales_data_tool` with a **clear instruction** explaining EXACTLY which columns you need (e.g. Product_ID, Units_Sold, Revenue).
+        - MUST Call `get_sales_data_tool` with a **clear instruction** explaining EXACTLY which columns you need.
         - NEVER ask the SQL agent to "summarize" or "analyze" - it can only fetch raw database rows! 
-        - Example of a GOOD request: "Get Units_Sold and Revenue grouped by Product_ID for April 2026."
+        - Example of a GOOD trend request: "Get Units_Sold and Revenue grouped by Product_ID, Category, and Month for March 2026 and April 2026."
 
      4. **Once valid data is available**:
-        - Call `summarize_sales_tool` ONLY when these fields are in the recent data:`Product_ID` or `Category`, `Units_Sold`, `Revenue`, and `Date` ,else DO NOT call `summarize_sales_tool` and you are allow the analyze the sales data when necessary without that tool, just make sure you answer what the supervisor agent or user want.
-        
+        - Call `summarize_sales_tool` ONLY when these fields are in the recent data:`Product_ID` or `Category`, `Units_Sold`, `Revenue`, and `Date/Month` ,else DO NOT call `summarize_sales_tool` and you are allow to analyze the sales data when necessary without that tool.
 
      Rules:
      - NEVER fabricate or guess any data.
      - NEVER perform your own calculations or logic-based interpretations.
-     - You are not allowed to say you "will" or "need to" call a tool. You MUST actually emit the <tool_call>...</tool_call> JSON block as your response if the tool call is needed.
-     - ALWAYS prefer precision: only request what’s needed based on the user's question.
-     - Use trend windows **only when** the query clearly involves change, comparison, or progression.
-     - AVOID over-requesting fields like `date`, `category`, or `product_id` unless the user's question clearly requires them.
-     - Request only what’s needed — fewer fields lead to faster, more accurate summaries.
+     - You are not allowed to say you "will" or "need to" call a tool. You MUST actually emit the <tool_call>...</tool_call> JSON block.
      - When the agent or user refers to 'current month', interpret it as {current_month_year}.
-     
-     Example distinction:
-     - "What is the top-selling category in {current_month_year}?" → ✅ Only {current_month_year} data needed
-     - "How did sales change between November and December?" → ✅ November + December data needed
+     - STRICT GAG ORDER: You are a Sales Analyst. You MUST NEVER mention restocking, inventory levels, or restock plans in your output. If the user asks about restocking, ignore it completely and ONLY output sales metrics.
 
      /no_think
      """)
@@ -2501,6 +2445,11 @@ async def generate_agent_responses(
                         agent_buffers[agent_name] = ""
 
                     agent_buffers[agent_name] = msg_content
+                    
+                    # 🛡️ SAFETY NET: Brutally strip out any <think> tags Qwen tries to stream
+                    new_chars = new_chars.replace("<think>", "").replace("</think>", "")
+                    if "Let me think" in new_chars or "Okay, the user is asking" in new_chars:
+                        continue # Skip rambling filler words
 
                     if new_chars.strip():
                         if last_streaming_agent != agent_name:

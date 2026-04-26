@@ -8,17 +8,17 @@ print("🔌 Booting up Power Choice Supply Chain Simulation...")
 # 1. Connect to your Docker MySQL Database
 engine = create_engine("mysql+pymysql://root:root@127.0.0.1:3306/retail")
 
-# 2. Define the Power Choice SKUs with Deep Supply Chain Metrics
+# 2. Define the Power Choice SKUs (LEAN MANUFACTURING MODE)
 products = [
     {
         "Product_ID": "WIRE-22AWG", 
         "Category": "Wire & Cabling", 
-        "Unit_Cost": 4.50,          # Cost to manufacture/buy
-        "Base_Price": 12.50,        # Selling price
-        "Lead_Time_Days": 14,       # Takes 2 weeks to arrive from supplier
-        "Safety_Stock": 1500,       # Absolute minimum allowed before production stops
-        "Starting_Stock": 8000,     # Max warehouse capacity
-        "Daily_Demand": (50, 150)   # Realistic random daily usage range
+        "Unit_Cost": 4.50,          
+        "Base_Price": 12.50,        
+        "Lead_Time_Days": 14,       
+        "Safety_Stock": 500,        # 🚨 Reduced
+        "Starting_Stock": 2500,     # 🚨 Drastically Reduced
+        "Daily_Demand": (50, 150)   
     },
     {
         "Product_ID": "WIRE-18AWG", 
@@ -26,8 +26,8 @@ products = [
         "Unit_Cost": 6.00, 
         "Base_Price": 18.00, 
         "Lead_Time_Days": 14, 
-        "Safety_Stock": 1000, 
-        "Starting_Stock": 5000, 
+        "Safety_Stock": 400, 
+        "Starting_Stock": 1500, 
         "Daily_Demand": (30, 100)
     },
     {
@@ -36,8 +36,8 @@ products = [
         "Unit_Cost": 0.15, 
         "Base_Price": 0.45, 
         "Lead_Time_Days": 7, 
-        "Safety_Stock": 5000, 
-        "Starting_Stock": 20000, 
+        "Safety_Stock": 1000, 
+        "Starting_Stock": 4000, 
         "Daily_Demand": (200, 600)
     },
     {
@@ -46,8 +46,8 @@ products = [
         "Unit_Cost": 0.40, 
         "Base_Price": 1.20, 
         "Lead_Time_Days": 10, 
-        "Safety_Stock": 3000, 
-        "Starting_Stock": 10000, 
+        "Safety_Stock": 800, 
+        "Starting_Stock": 3000, 
         "Daily_Demand": (100, 400)
     },
     {
@@ -56,8 +56,8 @@ products = [
         "Unit_Cost": 20.00, 
         "Base_Price": 45.00, 
         "Lead_Time_Days": 21, 
-        "Safety_Stock": 500, 
-        "Starting_Stock": 3000, 
+        "Safety_Stock": 150, 
+        "Starting_Stock": 800, 
         "Daily_Demand": (10, 40)
     },
     {
@@ -66,13 +66,11 @@ products = [
         "Unit_Cost": 45.00, 
         "Base_Price": 85.00, 
         "Lead_Time_Days": 30, 
-        "Safety_Stock": 200, 
-        "Starting_Stock": 1500, 
+        "Safety_Stock": 100, 
+        "Starting_Stock": 500, 
         "Daily_Demand": (5, 20)
     }
 ]
-
-store_id = "BM-01"
 
 # 3. Generate exactly 120 days (Jan 1, 2026 to Apr 30, 2026)
 start_date = datetime(2026, 1, 1)
@@ -88,30 +86,37 @@ for single_date in pd.date_range(start_date, end_date):
     for p in products:
         pid = p["Product_ID"]
         
-        # --- A. Process Incoming Shipments (Lead Time complete) ---
-        arrived_today = [d['qty'] for d in scheduled_deliveries[pid] if d['date'].date() == single_date.date()]
-        if arrived_today:
-            current_inventory[pid] += sum(arrived_today)
-            
-        # Clear out arrived shipments from the queue
-        scheduled_deliveries[pid] = [d for d in scheduled_deliveries[pid] if d['date'].date() != single_date.date()]
+        # --- A. Process Incoming Shipments ---
+        # 🚨 DEMO TRICK: "The Port Strike"
+        # We simulate a supplier delay from April 15th onwards. No deliveries arrive!
+        # This guarantees the inventory will crash into CRITICAL status by April 30 for the demo.
+        # We simulate a massive 30-day supplier delay starting April 1st!
+        is_port_strike = single_date >= datetime(2026, 4, 1)
+        
+        if not is_port_strike:
+            arrived_today = [d['qty'] for d in scheduled_deliveries[pid] if d['date'].date() == single_date.date()]
+            if arrived_today:
+                current_inventory[pid] += sum(arrived_today)
+        else:
+            # Push delivery dates back endlessly so they never arrive in April
+            for d in scheduled_deliveries[pid]:
+                d['date'] = single_date + timedelta(days=1)
+                
+        # Clear out arrived shipments from the queue (if not striking)
+        if not is_port_strike:
+            scheduled_deliveries[pid] = [d for d in scheduled_deliveries[pid] if d['date'].date() != single_date.date()]
 
         # --- B. Daily Production Demand (Sales/Usage) ---
         units_sold = random.randint(p["Daily_Demand"][0], p["Daily_Demand"][1])
-        units_sold = min(units_sold, current_inventory[pid]) # Cannot sell what we don't have
+        units_sold = min(units_sold, current_inventory[pid]) 
         current_inventory[pid] -= units_sold
         
         # --- C. Intelligent Restock Trigger (Reorder Point Math) ---
-        # ROP = Safety Stock + (Average Daily Demand * Lead Time)
         avg_daily_demand = sum(p["Daily_Demand"]) / 2
         reorder_point = p["Safety_Stock"] + (avg_daily_demand * p["Lead_Time_Days"])
-        
-        # Are we expecting any deliveries?
         pending_qty = sum(d['qty'] for d in scheduled_deliveries[pid])
         
-        # If our current stock + incoming stock is below the ROP, trigger an order!
         if (current_inventory[pid] + pending_qty) < reorder_point:
-            # Order enough to get back to warehouse capacity
             order_qty = p["Starting_Stock"] - current_inventory[pid]
             delivery_date = single_date + timedelta(days=p["Lead_Time_Days"])
             scheduled_deliveries[pid].append({'date': delivery_date, 'qty': order_qty})
